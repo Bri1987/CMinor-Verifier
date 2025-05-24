@@ -79,9 +79,7 @@ namespace cminor
         private List<Expression> handleFuncRankExps(FunctionCallStatement funcCallStmt) {
             Function callFunc = funcCallStmt.rhs.function;
             // 秩函数处理, 要深拷贝!
-            List<Expression> rankExps = new List<Expression>();
-            for(int i = 0; i < callFunc.entryLocation.rankingFunctions.Count; i++)
-                rankExps.Add(callFunc.entryLocation.rankingFunctions[i]);
+            List<Expression> rankExps = new List<Expression>(callFunc.entryLocation.rankingFunctions);
             
             // 秩函数都可能涉及到很多参数，一个个单独处理，需要双层循环
             for(int i = 0; i < rankExps.Count; i++) {
@@ -203,8 +201,8 @@ namespace cminor
         }
 
         // 输入前置和后置条件, 调用solver
-        private bool getResult(Expression pre, Expression post) {
-            ImplicationExpression partFinal = new ImplicationExpression(pre, post);
+        private bool getResult(List<Expression> pre, Expression post) {
+            ImplicationExpression partFinal = new ImplicationExpression(ConditionListToExpression(pre), post);
             partFinal.Print(writer);
             Console.Write("\n");
             // 具体CheckValid里面已经有取反操作，这里不需要再做
@@ -218,13 +216,23 @@ namespace cminor
             return true;
         }
 
+        private BasicPath deepCopyBasicPath(BasicPath basicPath) {
+            BasicPath newPath = new BasicPath();
+            newPath.statements = new List<Statement>(basicPath.statements);
+            newPath.headConditions = new List<Expression>(basicPath.headConditions);
+            newPath.tailConditions = new List<Expression>(basicPath.tailConditions);
+            newPath.headRankingFunctions = new List<Expression>(basicPath.headRankingFunctions);
+            newPath.tailRankingFunctions = new List<Expression>(basicPath.tailRankingFunctions);
+            return newPath;
+        }
+
         // 一个函数一个函数判断
         private int checkOneFunc(Function func) {
             func.Print(writer);
             // 拿到前置条件
-            Expression preExpression = ConditionListToExpression(func.entryLocation.conditions);
+            List<Expression> preExpression = func.entryLocation.conditions;
             // 拿到后置条件
-            Expression postExpression = ConditionListToExpression(func.exitLocation.conditions);
+            List<Expression> postExpression = func.exitLocation.conditions;
             // 拿到秩函数
             List<Expression> rankingExpressions = func.entryLocation.rankingFunctions;
             // 判断秩函数不能为负
@@ -233,21 +241,25 @@ namespace cminor
                     return -1;
             }
 
-            // 记录所有走过的循环头，避免重复处理
-            HashSet<int> haveMeetLoopHeads = new HashSet<int>();
-
             // 整体思路:
             // 1. 正向找路径
             // 2. 反向wlp
 
-            Expression exp = postExpression;
-            Queue<(List<Statement>, Location, Expression, Expression, List<Expression>, List<Expression>)> pathList
-             = new Queue<(List<Statement>, Location, Expression, Expression, List<Expression>, List<Expression>)>();
-            pathList.Enqueue((new List<Statement>(), func.entryLocation, preExpression, postExpression, rankingExpressions, new List<Expression>()));
+            Expression exp;
+            Queue<(Location, BasicPath, HashSet<int>)> pathList = new Queue<(Location, BasicPath, HashSet<int>)>();
+            BasicPath firstPath = new BasicPath();
+            firstPath.headConditions = preExpression;
+            firstPath.tailConditions = postExpression;
+            firstPath.headRankingFunctions = rankingExpressions;
+            pathList.Enqueue((func.entryLocation, firstPath, new HashSet<int>()));
             while(pathList.Count > 0) {
-                (List<Statement> stmts, Location loc, Expression preExp, Expression postExp, List<Expression> rankHead, List<Expression> rankTail) 
-                 = pathList.Dequeue();
+                (Location loc, BasicPath curPath, HashSet<int> haveMeetLoopHeads) = pathList.Dequeue();
                 Console.Write("travel {0}\n", loc.number);
+                List<Statement> stmts = curPath.statements;
+                List<Expression> preExp = curPath.headConditions;
+                List<Expression> postExp = curPath.tailConditions;
+                List<Expression> rankHead = curPath.headRankingFunctions;
+                List<Expression> rankTail = curPath.tailRankingFunctions;
 
                 // 判断是否到终点，到终点就路径结束, 开始反向wlp, 否则则继续遍历; 其中循环和函数调用需要分别处理
 
@@ -289,12 +301,15 @@ namespace cminor
 
                             // 加上stmt
                             beforeStmts.Add(stmt);
-                            pathList.Enqueue((beforeStmts, succLoc, preExp, postExp, rankHead, rankTail));
+
+                            BasicPath newPath = deepCopyBasicPath(curPath);
+                            newPath.statements = beforeStmts;
+                            pathList.Enqueue((succLoc, newPath, haveMeetLoopHeads));
                         }
                     } else {
                         // 说明它又是函数调用语句又是结尾, 原有的stmts加上assume语句直接处理
                         stmts.Add(assumeStmt);
-                        exp = reverseRunStmts(stmts, postExp, true);
+                        exp = reverseRunStmts(stmts, ConditionListToExpression(postExp), true);
                         if(!getResult(preExp, exp))
                             return -1;
                     }
@@ -342,13 +357,18 @@ namespace cminor
 
                         List<Statement> newStmts = new List<Statement>();
                         newStmts.Add(stmt);
-                        pathList.Enqueue((newStmts, succLoc, loopInvariants, postExp, loopRankExps, rankTail));
+
+                        BasicPath newPath = deepCopyBasicPath(curPath);
+                        newPath.statements = newStmts;
+                        newPath.headConditions = loopLoc.invariants;
+                        newPath.headRankingFunctions = loopRankExps;
+                        pathList.Enqueue((succLoc, newPath, haveMeetLoopHeads));
                     }
 
                 } else if(loc.succLocations.Count == 0) {
-                    // 已经走到最前面了, 可以开始验证了
+                    // 已经走到最后面了, 可以开始验证了
                     // 先运行整个的stmt, 反向wlp
-                    exp = reverseRunStmts(stmts, postExp, true);
+                    exp = reverseRunStmts(stmts, ConditionListToExpression(postExp), true);
                     if(!getResult(preExp, exp))
                         return -1;
                 } else {
@@ -357,9 +377,7 @@ namespace cminor
                         var succLoc = loc.succLocations[i];
                         Console.Write("add {0}\n", succLoc.number);
                         // 如果直接对List赋值会浅拷贝发生错误
-                        List<Statement> newStmts = new List<Statement>(); 
-                        for(int j = 0; j < stmts.Count; j++)
-                            newStmts.Add(stmts[j]);
+                        List<Statement> newStmts = new List<Statement>(stmts);
                         if(loc.succStatements[i] != null) {
                             var succStmt = loc.succStatements[i]!;
                             if(succStmt is FunctionCallStatement) {
@@ -367,7 +385,9 @@ namespace cminor
                             }
                             newStmts.Add(succStmt);
                         }
-                        pathList.Enqueue((newStmts, succLoc, preExp, postExp, rankHead, rankTail));
+                        BasicPath newPath = deepCopyBasicPath(curPath);
+                        newPath.statements = newStmts;
+                        pathList.Enqueue((succLoc, newPath, haveMeetLoopHeads));
                     }
                 }
             }
